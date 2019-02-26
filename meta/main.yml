@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  author: Mikko Hakala (https://github.com/mhakala)
+  description: Add gpu utilization stats to Slurm batch scheduler accounting db
+  license: Apache 2.0
+  min_ansible_version: 2.7
+
+  platforms:
+  - name: EL
+    - 7
+
