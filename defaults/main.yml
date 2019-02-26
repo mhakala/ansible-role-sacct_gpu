@@ -1,3 +1,6 @@
 ---
 
+# by default do not assume gpu's are present
+gpu: False
 sacctgpu_bin: "/usr/local/bin"
+
