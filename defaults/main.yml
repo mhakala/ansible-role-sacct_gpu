@@ -4,3 +4,6 @@
 gpu: False
 sacctgpu_bin: "/usr/local/bin"
 
+# Slurm's epilog script where to add call to this function
+sacctgpu_epilog: "/usr/bin/epilog"
+

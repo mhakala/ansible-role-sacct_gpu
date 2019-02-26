@@ -11,3 +11,14 @@
     name: "gpu_stats collect data"
     job: "{{ sacctgpu_bin }}/gpu_stat.py > /dev/null"
     state: "present"
+
+- name: Set content fact
+  set_fact:
+    sacctgpu_content: "{{ lookup('file', 'files/epilog.sh') }}"
+
+- name: Add call to Epilog
+  blockinfile:
+    path: "{{ sacctgpu_epilog }}"
+    content: '{{ sacctgpu_content }}'
+    state: present
+
