@@ -1,74 +1,95 @@
-#!/usr/bin/python
+#!/packages/python/anaconda3/default/bin/python
 
 # author mhakala
 import json
 import re
 import subprocess
+import tempfile
+import os
 
-# find slurm-job-ids active on this node
+
 def jobs_running():
-   task = subprocess.Popen('ps -ef|grep "/var/spool/slurmd/"|grep job|sed s/.*job//|cut -d"/" -f1', shell=True, stdout=subprocess.PIPE)
-   data = task.stdout.read()
-   assert task.wait() == 0
-   jobs = []
+   """find slurm-job-ids active on this node"""
+   data = subprocess.check_output(['squeue', '-w', os.uname()[1].split('.')[0], '-h', '-o', '%A']).decode()
+   return data.split()
 
-   for row in data.split('\n'):
-      if len(row) > 1:
-          jobs.append(row)
 
-   return jobs
-
-# convert pid to slurm jobid
 def pid2id(pid):
-   output = subprocess.check_output("cat /proc/%s/cgroup |grep cpuset" % pid, shell=True)
-   m = re.search('.*job_(\d+)\/.*', output)
-   if m:
-      return m.group(1)
-   else:
-      return '0'
+   """convert pid to slurm jobid"""
+   with open('/proc/%s/cgroup' % pid) as f:
+      for line in f:
+         m = re.search('.*slurm\/uid_.*\/job_(\d+)\/.*', line)
+         if m:
+            return m.group(1)
+   return None
+
 
 # get needed slurm values for each running job on the node
 def job_info(jobs,current):
    for job in jobs:
-      output = subprocess.check_output("scontrol -o show job %s" % job, shell=True)
-      cpus   = re.search('.*NumCPUs=(\d+)\s',output)
-      gres   = re.search('.*Gres=.*:(\d+)\s',output)
-      nodes  = re.search('.*NumNodes=(\d+)\s',output)
+      output = subprocess.check_output(['scontrol', '-o', 'show', 'job', job]).decode()
+      cpus   = re.search('NumCPUs=(\d+)', output)
+      tres   = re.search('TRES=(\S+)', output).group(1)
+      nodes  = re.search('NumNodes=(\d+)', output)
+
+      ngpu = 0
+      for g in tres.split(','):
+         gs = g.split('=')
+         if gs[0] == 'gres/gpu:tesla':
+            if len(gs) == 1:
+               ngpu = 1
+            else:
+               ngpu = int(gs[-1])
 
       # drop multi-node jobs (will be added later if needed)
       if int(nodes.group(1)) > 1:
          del current[job]
       else:
-         current[job]['ngpu']=int(gres.group(1))
+         current[job]['ngpu'] = ngpu
          current[job]['ncpu']=int(cpus.group(1))
 
    return current
 
 
 def gpu_info(jobinfo):
-   # get gpu/mem/pid stats in a single line per gpu-core (a bit ugly to get one-liner output)
-   output = subprocess.check_output("nvidia-smi -q -d pids,utilization | \
-   egrep '(Gpu|^\s+Memory\s+:|Process ID|^GPU)' | \
-   grep -B2 ID|grep -v '\-\-' | \
-   sed 'N;N;s/\\n//g'|sed s/'\s\s*'/' '/g",  shell=True)
+   import xml.etree.cElementTree as ET
 
-   for row in output.split('\n'):
-      if(len(row) > 2):
-         vals=row.split(' ')
-         jobid=pid2id(vals[12])
-         gutil = float(vals[3])
-         mutil = float(vals[7])
+   output = subprocess.check_output(['nvidia-smi', '-q', '-x']).decode()
+   root = ET.fromstring(output)
 
-         # only update, if jobid not dropped (multinode jobs)
-         if jobid in jobinfo.keys():
-            jobinfo[jobid]['util']+=gutil/jobinfo[jobid]['ngpu']
-            jobinfo[jobid]['mem']+=mutil/jobinfo[jobid]['ngpu']
+   for gpu in root.findall('gpu'):
+      procs = gpu.find('processes')
+      mtot = 0.
+      jobid = None
+      # Here we assume that multiple job id's cannot access the same
+      # GPU
+      for pi in procs.findall('process_info'):
+         pid = pi.find('pid').text
+         jobid = pid2id(pid)
+         # Assume used_memory is of the form '1750 MiB'. Needs fixing
+         # if the unit is anything but MiB.
+         mtot += float(pi.find('used_memory').text.split()[0])
+      util = gpu.find('utilization')
+      # Here assume gpu utilization is of the form
+      # '100 %'
+      gutil = float(util.find('gpu_util').text.split()[0])
+
+      # power_draw is of the form 35.25 W
+      power = gpu.find('power_readings')
+      gpwrdraw = float(power.find('power_draw').text.split()[0])
+
+      # only update, if jobid not dropped (multinode jobs)
+      # import pdb; pdb.set_trace()
+      if jobid in jobinfo.keys():
+         if jobinfo[jobid]['ngpu'] != 0:
+            jobinfo[jobid]['gpu_util'] += gutil/jobinfo[jobid]['ngpu']
+         jobinfo[jobid]['gpu_power'] += gpwrdraw
+         jobinfo[jobid]['gpu_mem_max'] = max(mtot, jobinfo[jobid]['gpu_mem_max'])
 
    return jobinfo
 
-def read_shm():
+def read_shm(fil):
    import os.path
-   fil = '/run/gpustats.json'
    jobinfo = {}
 
    if(os.path.exists(fil)):
@@ -77,31 +98,49 @@ def read_shm():
 
    return jobinfo
 
+# def write_shm(jobinfo, fname):
+#    with tempfile.NamedTemporaryFile(mode='w', delete=False, \
+#                      dir=os.path.dirname(os.path.normpath(fname))) as fp:
+#       json.dump(jobinfo, fp)
+#    os.chmod(fp.name, 0o0644)
+#    os.rename(fp.name, fname)
 
 def write_shm(jobinfo):
-   with open('/run/gpustats.json', 'w') as fp:
-      json.dump(jobinfo, fp)
+   with open('/tmp/gpustats.json', 'w') as fp:
+      json.dump(jobinfo, fp)   
 
 def main():
+   import argparse
+   parser = argparse.ArgumentParser()
+   parser.add_argument('-n', '--nosleep', help="Don't sleep at the beginning",
+                       action="store_true")
+   parser.add_argument('fname', nargs='?', default='/tmp/gpustats.json',
+                       help='Name of JSON file for reading/storing data')
+   args = parser.parse_args()
+   if not args.nosleep:
+      import time
+      import random
+      time.sleep(random.randint(0, 30))
 
    # initialize stats
    current = {}
    jobs    = jobs_running()
 
    for job in jobs:
-      current[job]={'util': 0, 'mem': 0, 'ngpu': 0, 'ncpu': 0, 'step': 1}
+      current[job]={'gpu_util': 0, 'gpu_mem_max': 0, 'ngpu': 0, 'ncpu': 0, 'step': 1, 'gpu_power': 0 }
 
    # get current job info
    current = job_info(jobs, current)
    current = gpu_info(current)
 
-   # combine with previous steps
-   prev = read_shm()
+   # combine with previous steps, calculate avgs and max
+   prev = read_shm(args.fname)
    for job in jobs:
       if job in prev.keys():
          n = prev[job]['step']
-         current[job]['util'] = ( float(prev[job]['util'])*n+float(current[job]['util']) )/(n+1)
-         current[job]['mem']  = ( float(prev[job]['mem'])*n+float(current[job]['mem']) )/(n+1)
+         current[job]['gpu_util'] = ( float(prev[job]['gpu_util'])*n+float(current[job]['gpu_util']) )/(n+1)
+         current[job]['gpu_power'] = ( float(prev[job]['gpu_power'])*n+float(current[job]['gpu_power']) )/(n+1)
+         current[job]['gpu_mem_max']  = max(float(prev[job]['gpu_mem_max']), float(current[job]['gpu_mem_max']))
          current[job]['step'] = n+1
 
    # write json
